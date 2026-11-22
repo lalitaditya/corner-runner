@@ -18,7 +18,7 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v5"
+    name = "Corner Runner v6"
     loot_range = 160
     staging_weight = 0.8
     opening_cubes = 3
@@ -216,7 +216,34 @@ class Bot:
         p = me["pos"]
         foe, q = targets[0]
         others = [other for other, seen in self.tracks.values() if other["id"] != foe["id"] and t - seen < 5]
-        if self.saved_step and self.step_enemy == foe["id"] and t < self.next_step:
+        incoming = []
+        body_height = me["stats"]["eye_height"]
+        radius = me["stats"]["radius"] * (1 + me["cubes"] * self.config["cubes"]["size_per_cube"])
+        speed = me["stats"]["walk_speed"]
+        for projectile in obs["projectiles"]:
+            x, y, z = projectile["pos"]
+            vx, vy, vz = projectile["vel"]
+            dx, dy = p[0] - x, p[1] - y
+            closing_speed = vx * vx + vy * vy
+            if closing_speed < 1:
+                continue
+            dt = (dx * vx + dy * vy) / closing_speed
+            if not 0.08 < dt < 0.7:
+                continue
+            shell = projectile["kind"] == "mortar"
+            hazard = radius + (self.config["weapons"]["mortar"]["splash_radius"] if shell else 0.7)
+            height = z + vz * dt
+            if shell:
+                height -= 0.5 * self.config["weapons"]["mortar"]["gravity"] * dt * dt
+            miss_x, miss_y = vx * dt - dx, vy * dt - dy
+            if (
+                p[2] - hazard < height < p[2] + body_height + hazard
+                and math.hypot(miss_x, miss_y) < hazard + speed * dt
+            ):
+                incoming.append((dt, miss_x, miss_y, hazard))
+                if len(incoming) == 4:
+                    break
+        if not incoming and self.saved_step and self.step_enemy == foe["id"] and t < self.next_step:
             return self.saved_step
         best, score = None, -math.inf
         desired = 31 if me["weapons"][1] and me["weapons"][1]["kind"] == "lightning" else self.duel_range
@@ -235,6 +262,13 @@ class Bot:
             for other in others:
                 d = horizontal(point, other["pos"])
                 cost += max(0, 120 - d) * 1.1
+            for dt, miss_x, miss_y, hazard in incoming:
+                # During a change of direction, velocity cannot jump instantly.
+                coast = min(dt, 0.16)
+                shift_x = me["vel"][0] * coast + speed * dx * (dt - coast)
+                shift_y = me["vel"][1] * coast + speed * dy * (dt - coast)
+                miss = math.hypot(miss_x - shift_x, miss_y - shift_y)
+                cost += 7 * max(0, hazard + 1 - miss)
             cost += max(0, horizontal(point, zone["center"]) - zone["radius"] + 12) * 3
             if not self.map.shot_clear((p[0], p[1], p[2] + 3), (*point, self.map.floor[n] + 3)):
                 cost += 20
