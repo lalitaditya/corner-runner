@@ -18,7 +18,7 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v5"
+    name = "Corner Runner v7"
     loot_range = 160
     staging_weight = 0.8
     opening_cubes = 3
@@ -223,6 +223,23 @@ class Bot:
         if desired > 50 and "lightning" not in foe["weapons"] and me["cubes"] < 9:
             if len(others) <= 1 and me["hp"] > 1.1 * foe.get("hp", 1400):
                 desired = 28 if foe.get("hp", 1400) < 500 else 70
+        # Estimate how close each visible arc carrier can get before the next turn.
+        # A direct approach and a parallel strafe have different risks at the same range.
+        arc_positions = []
+        horizon = 0.8
+        stride = me["stats"]["walk_speed"] * horizon
+        safe_distance = self.config["weapons"]["lightning"]["range"] + 9
+        for enemy, seen in self.tracks.values():
+            if t - seen > 0.5 or "lightning" not in enemy["weapons"]:
+                continue
+            if desired <= 50 and enemy["id"] == foe["id"]:
+                continue
+            point = enemy["pos"]
+            if horizontal(p, point) > 100 or abs(p[2] - point[2]) > 18:
+                continue
+            if not self.map.shot_clear((*p[:2], p[2] + 5), (*point[:2], point[2] + 5)):
+                continue
+            arc_positions.append((point[0] + enemy["vel"][0] * horizon, point[1] + enemy["vel"][1] * horizon))
         for i in range(18):
             a = i * math.tau / 18
             dx, dy = math.cos(a), math.sin(a)
@@ -235,6 +252,11 @@ class Bot:
             for other in others:
                 d = horizontal(point, other["pos"])
                 cost += max(0, 120 - d) * 1.1
+            if arc_positions:
+                future_x, future_y = p[0] + dx * stride, p[1] + dy * stride
+                for arc_x, arc_y in arc_positions:
+                    separation = math.hypot(future_x - arc_x, future_y - arc_y)
+                    cost += 2.4 * max(0, safe_distance - separation)
             cost += max(0, horizontal(point, zone["center"]) - zone["radius"] + 12) * 3
             if not self.map.shot_clear((p[0], p[1], p[2] + 3), (*point, self.map.floor[n] + 3)):
                 cost += 20
@@ -846,6 +868,11 @@ class Bot:
                 "gun_velocity",
                 "gyros",
             ]
+            # When armor is healthy, the next beam upgrade can shorten the
+            # interval during which a second hunter can join this engagement.
+            if secondary == "laser" and health > 0.72:
+                ranks.remove("laser_damage")
+                ranks.insert(1, "laser_damage")
             act["pick"] = min(
                 range(len(offer["choices"])),
                 key=lambda i: (
