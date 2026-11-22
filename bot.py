@@ -18,7 +18,7 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v9"
+    name = "Corner Runner v10"
     loot_range = 160
     staging_weight = 0.8
     opening_cubes = 3
@@ -35,6 +35,7 @@ class Bot:
         self.config = hello["config"]
         self.reach = self.config["loot"]["pickup_radius"]
         self.tracks = {}
+        self.exchanges = {}
         self.items = {}
         self.roof = None
         self.roof_retries = {}
@@ -60,6 +61,9 @@ class Bot:
         self.scanned = set()
         self.next_step = -1
         self.saved_step = None
+        self.peek_origin = None
+        self.peek_after = 0
+        self.peek_expiry = 0
         self.step_enemy = None
         self.withdraw_until = -1
         self.footing = None
@@ -211,6 +215,47 @@ class Bot:
                     break
         return earliest
 
+    def next_salvo(self, me, distance):
+        """Seconds until either weapon can deal useful damage at this range."""
+        gun, secondary = me["weapons"]
+        gun_wait = max(gun["reload"], gun["cooldown"])
+        if gun["ammo"] == 0 and gun_wait == 0:
+            gun_wait = gun["stats"]["reload"]
+        if distance > gun["stats"]["range"]:
+            gun_wait = math.inf
+        if not secondary or distance > secondary["stats"]["range"]:
+            return gun_wait
+        stats = secondary["stats"]
+        if secondary["kind"] == "laser":
+            wait = secondary["cooldown"] + max(0, stats["charge"] - secondary.get("charge", 0))
+        elif secondary["kind"] == "lightning" and me["energy"] >= stats["energy"]:
+            wait = secondary["cooldown"]
+        else:
+            return gun_wait
+        return min(gun_wait, wait)
+
+    def firing_threats(self, obs, foe_id):
+        """Fresh, aligned opponents which can shoot along the next step."""
+        p, t = obs["self"]["pos"], obs["t"]
+        threats = []
+        for other, seen in self.tracks.values():
+            if other["id"] == foe_id or t - seen > 0.25:
+                continue
+            e = other["pos"]
+            d = horizontal(p, e)
+            charged = other.get("charging", False)
+            if d > (250 if charged else 150):
+                continue
+            bearing = math.atan2(p[1] - e[1], p[0] - e[0])
+            error = abs(math.remainder(bearing - other["aim"][0], math.tau))
+            if error > 0.48 and not (d < 60 and "lightning" in other["weapons"]):
+                continue
+            scale = 1 + other.get("cubes", 0) * self.config["cubes"]["size_per_cube"]
+            origin = (e[0], e[1], e[2] + self.config["mech"]["muzzle_height"] * scale)
+            weight = 1 + int(charged) + max(0, (60 - d) / 60)
+            threats.append((weight, d, origin))
+        return sorted(threats, key=lambda x: (-x[0], x[1]))[:2]
+
     def ring_move(self, obs, targets):
         me, zone, t = obs["self"], obs["zone"], obs["t"]
         p = me["pos"]
@@ -240,6 +285,10 @@ class Bot:
             if not self.map.shot_clear((*p[:2], p[2] + 5), (*point[:2], point[2] + 5)):
                 continue
             arc_positions.append((point[0] + enemy["vel"][0] * horizon, point[1] + enemy["vel"][1] * horizon))
+        current_range = horizontal(p, q)
+        wait = self.next_salvo(me, current_range)
+        reloading = 0.7 < wait < 6
+        forward_lines = self.firing_threats(obs, foe["id"])
         for i in range(18):
             a = i * math.tau / 18
             dx, dy = math.cos(a), math.sin(a)
@@ -263,10 +312,32 @@ class Bot:
             d0 = max(1, horizontal(p, q))
             tangent = ((p[0] - q[0]) * dy - (p[1] - q[1]) * dx) / d0
             cost -= tangent * (1 if int(t / 1.25) % 2 else -1) * 3.4
+            if reloading or forward_lines:
+                next_pos = (p[0] + dx * stride, p[1] + dy * stride)
+                next_cell = self.map.cell(next_pos)
+                if self.map.edges[next_cell]:
+                    eye = (*next_pos, self.map.floor[next_cell] + me["stats"]["eye_height"])
+                    lane_open = self.map.shot_clear(eye, q)
+                    if reloading:
+                        cost += 33 * lane_open
+                    elif not lane_open:
+                        cost += 12
+                    for danger, _, gun_pos in forward_lines:
+                        if self.map.shot_clear(gun_pos, eye):
+                            cost += 17 * danger
             if -cost > score:
                 score, best = -cost, [dx, dy]
         if best is None:
             return self.duel_move(obs, foe)
+        if reloading and self.map.shot_clear((*p[:2], p[2] + me["stats"]["eye_height"]), q):
+            nxt = (p[0] + best[0] * stride, p[1] + best[1] * stride)
+            c = self.map.cell(nxt)
+            if self.map.edges[c] and not self.map.shot_clear(
+                (*nxt, self.map.floor[c] + me["stats"]["eye_height"]), q
+            ):
+                self.peek_origin = p[:]
+                self.peek_after = t + min(wait, 2.3)
+                self.peek_expiry = t + 3.2
         self.step_enemy = foe["id"]
         self.next_step = t + 0.35
         self.saved_step = best, me["energy"] > 30 and horizontal(p, q) < 0.8 * desired, False
@@ -406,6 +477,16 @@ class Bot:
                 move = toward(p, center)
             return move, any(move) and me["grounded"] and me["energy"] > 12, False
 
+        # If this step put a wall between us and the fight, wait for the
+        # magazine or beam, then return to the shooting position we just left.
+        if self.peek_origin is not None and not targets and not self.healing and now < self.peek_expiry:
+            d = horizontal(p, self.peek_origin)
+            if 2 < d < 22 and abs(p[2] - self.peek_origin[2]) < 3:
+                if now < self.peek_after:
+                    return [0, 0], False, False
+                key = ("peek", *self.peek_origin[:2])
+                move = self.follow(p, key, now, lambda: self.map.travel(p, self.peek_origin))
+                return move, False, False
         if health >= 0.88:
             self.roof = None
             self.perched = False
@@ -425,6 +506,37 @@ class Bot:
             self.perched = True
         if self.perched and roof and p[2] >= roof[3] - 3:
             on_roof = True
+        # Follow a wounded opponent briefly after losing sight at a corner.
+        # Break off if a second mech could cover its escape.
+        if not targets and not self.healing and second and health > 0.55 and not on_roof:
+            best = None
+            for ident, (stamp, damage, incoming) in self.exchanges.items():
+                track = self.tracks.get(ident)
+                if now - stamp > 3 or not track:
+                    continue
+                victim, seen = track
+                point = victim["pos"]
+                distance = horizontal(p, point)
+                if now - seen > 1.8 or not 12 < distance < 105 or abs(p[2] - point[2]) > 8:
+                    continue
+                if victim["hp"] > 0.7 * me["hp"] or damage < max(120, incoming + 80):
+                    continue
+                supported = any(
+                    other["id"] != ident
+                    and now - observed < 3
+                    and min(horizontal(point, other["pos"]), horizontal(p, other["pos"])) < 90
+                    for other, observed in self.tracks.values()
+                )
+                if supported or horizontal(point, zone["center"]) + 5 > zone["radius"]:
+                    continue
+                cost = victim["hp"] + 3 * distance
+                if best is None or cost < best[0]:
+                    best = cost, ident, point
+            if best:
+                _, ident, point = best
+                move = self.follow(p, ("press", ident), now, lambda: self.map.travel(p, point))
+                if any(move):
+                    return move, me["energy"] > 55, False
         if (
             not on_roof
             and not targets
@@ -675,6 +787,18 @@ class Bot:
                 self.tracks[enemy["id"]] = enemy, now
         self.tracks = {i: t for i, t in self.tracks.items() if now - t[1] < 7}
         for e in obs["events"]:
+            if e["type"] in ("hit", "damaged"):
+                victim = e.get("target") if e["type"] == "hit" else e.get("by")
+                if victim in self.tracks:
+                    stamp, delivered, received = self.exchanges.get(victim, (now, 0.0, 0.0))
+                    decay = math.exp(-max(0, now - stamp) / 3)
+                    delivered *= decay
+                    received *= decay
+                    if e["type"] == "hit":
+                        delivered += e.get("amount", 0)
+                    else:
+                        received += e.get("amount", 0)
+                    self.exchanges[victim] = now, delivered, received
             if e["type"] == "damaged" and e.get("by") is not None:
                 self.attackers[e["by"]] = now
             if e["type"] == "hit" and e.get("target") in self.tracks:
@@ -797,6 +921,27 @@ class Bot:
             )
 
         targets.sort(key=removal_cost)
+        if targets:
+            foe, point = targets[0]
+            stamp, delivered, received = self.exchanges.get(foe["id"], (now, 0.0, 0.0))
+            fade = math.exp(-max(0, now - stamp) / 3)
+            delivered *= fade
+            received *= fade
+            # Only let damage history change the decision after a meaningful exchange.
+            exposure = sum(
+                (incoming * math.exp(-max(0, now - stamp) / 3))
+                for ident, (stamp, _, incoming) in self.exchanges.items()
+                if ident != foe["id"] and now - stamp < 6
+            )
+            if (
+                received + exposure > 240
+                and (received + exposure) * foe["hp"] > max(70, delivered) * me["hp"] * 1.35
+            ):
+                self.healing = True
+                self.withdraw_until = max(self.withdraw_until, now + 0.8)
+            elif delivered > 200 and delivered * me["hp"] > (received + exposure + 90) * foe["hp"] * 1.5:
+                self.healing = False
+                self.withdraw_until = now
         self.last_target = targets[0][0]["id"] if targets else None
         if self.healing and now - self.last_hit > 1.1:
             targets = [

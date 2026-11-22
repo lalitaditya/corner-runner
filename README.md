@@ -6,9 +6,15 @@ A Python bot for Builders Mech Royale. The practice opponent is a squad of 15 me
 - **Once equipped** it looks for a lone opponent it can reach with its weapon, keeps the autocannon on the same target, and collects the dropped cubes when the approach looks clear. For a wounded opponent, it estimates the seconds needed to finish using magazine state, secondary cooldown, range and cube bonuses. It checks other tracked mechs’ aim, motion and projected sightlines before committing to a quick finish. After an elimination, it can collect a nearby cluster of visible cubes inside the zone, provided known opponents are far enough away. At the cube combat-stat cap it stops dedicated cube collection routes and keeps its position for the next engagement. In a duel, the bot projects both its strafe and nearby lightning carriers’ movement over the next 0.8 seconds. It favors paths outside arc range when using its gun or laser, and can still close on its own lightning target.
 - **Between fights** it scouts while healthy and uses solid cover to recover when damaged. It drops its rooftop objective at 88% health and checks the next safe zone before continuing. Trees are traversable and can conceal movement at range. Buildings can also stop shots.
 
+## Fighting from a corner
+
+Corner Runner keeps a short history of damage dealt to and received from each tracked opponent. It uses the armor left on both mechs and damage from other shooters to decide whether to trade another burst or seek cover. When a wounded opponent breaks sight, the bot can pursue briefly if the approach stays in the zone and nearby enemies cannot cover it.
+
+During a duel, it estimates when either weapon can deal damage again. It can move behind a wall during a reload, remember the firing position, and return there when a weapon is ready. It checks the aim and sightlines of up to two additional threats before choosing its next step.
+
 ## Strategy reference
 
-We compared Corner Runner with the public Apex-Go bot on identical local starts. That comparison informed the focus on acquiring a secondary early and converting fights into placement. Corner Runner implements its own policy in Python. [Apex-Go benchmark revision](https://github.com/ahmad-ovh/Buildathon/tree/a484109a70db447abd390ffe871c32026cd15d7e)
+We compared Corner Runner with the public Apex-Go bot on identical local starts. That comparison informed the focus on acquiring a secondary early, evaluating damage trades, and using weapon downtime to move behind cover. Corner Runner implements its own policy in Python. [Apex-Go benchmark revision](https://github.com/ahmad-ovh/Buildathon/tree/a484109a70db447abd390ffe871c32026cd15d7e)
 
 ## Learned aiming
 
