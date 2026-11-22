@@ -18,7 +18,7 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v12"
+    name = "mech-royal"
     loot_range = 160
     staging_weight = 0.8
     opening_cubes = 3
@@ -81,7 +81,7 @@ class Bot:
             and (len(self.path[0]) == 2 or self.path[0][2] <= pos[2] + 1.25)
         ):
             self.path.pop(0)
-        if self.path and len(self.path[0]) == 3:
+        if self.path and len(self.path[0]) == 3 and self.path[0][2] > pos[2] + 1.25:
             self.climb = self.path[0][2]
         return toward(pos, self.path[0]) if self.path else [0, 0]
 
@@ -407,9 +407,11 @@ class Bot:
         cubes = [obj for obj, seen in self.cube_memory.values() if now - seen < 3]
         boxes = obs["crates"]
         drones = [obj for obj in obs["mechs"] if obj["kind"] == "npc"]
-        if not second:
-            for obj in weapons:
-                candidates.append(("kit", obj, 3.9 if obj["kind"] == "laser" else 2.9, 0))
+        for obj in weapons:
+            if second and (second["kind"] == "laser" or obj["kind"] != "laser"):
+                continue
+            kit_value = 6.2 if obj["kind"] == "laser" else 2.6
+            candidates.append(("kit", obj, kit_value, 0))
         useful_kit = any(
             abs(p[2] - w["pos"][2]) <= 4 and horizontal(p, w["pos"]) < 100
             and horizontal(w["pos"], zone["center"]) < zone["radius"] - 5
@@ -440,7 +442,7 @@ class Bot:
                 continue
             # A short second pickup makes this approach more valuable than an isolated item.
             if kind == "kit" and any(horizontal(q, other["pos"]) < 27 for other in (*cubes, *boxes)):
-                value += 0.8
+                value += 1.2
             if kind != "kit" and not second and any(horizontal(q, other["pos"]) < 27 for other in weapons):
                 value += 0.8
             cost = (distance / speed + work + 0.3 + max(0, 78 - nearest) * 0.09) / value
@@ -543,7 +545,7 @@ class Bot:
             and not self.healing
             and health > 0.58
             and now < self.opening_seconds
-            and (not second or me["cubes"] < self.opening_cubes)
+            and (not second or second["kind"] != "laser" or me["cubes"] < self.opening_cubes)
         ):
             opening = self.opening_goal(obs, eyes)
             if opening is not None:
@@ -1123,16 +1125,24 @@ class Bot:
                 needed = (1.15 * enemy.get("hp", 1400) / damage - minimum) / (1 - minimum)
                 threshold *= min(1, max(0.28, needed))
             beam_aim = charging and second["charge"] + 0.10 >= threshold
-            lead = frame if beam_aim else frame + distance / gun["stats"]["speed"]
+            # The next shot may be on the second physics tick of this command.
+            cycle = max(gun["cooldown"], gun["reload"])
+            firing_delay = frame if beam_aim else min(2 * frame, max(frame, cycle))
+            muzzle_distance = me["stats"]["radius"] + 0.5
+            flight = max(0.0, distance - muzzle_distance) / gun["stats"]["speed"]
+            # A moving target changes range while a round is in flight.
+            radial = sum((target[i] - muzzle[i]) * velocity[i] for i in range(3)) / max(1, distance)
+            flight /= max(0.8, 1 - radial / gun["stats"]["speed"])
+            lead = firing_delay if beam_aim else firing_delay + flight
             prev = self.previous_velocity.get(enemy["id"])
             previous = prev[1] if prev and 0 < now - prev[0] < 0.15 else None
             self.previous_velocity[enemy["id"]] = now, velocity[:]
             tx, ty = (
                 (lead * velocity[0], lead * velocity[1]) if beam_aim else offset(velocity, previous, lead)
             )
-            dx = target[0] + tx - muzzle[0] - me["vel"][0] * frame
-            dy = target[1] + ty - muzzle[1] - me["vel"][1] * frame
-            dz = target[2] + velocity[2] * min(0.25, lead) - muzzle[2] - me["vel"][2] * frame
+            dx = target[0] + tx - muzzle[0] - me["vel"][0] * firing_delay
+            dy = target[1] + ty - muzzle[1] - me["vel"][1] * firing_delay
+            dz = target[2] + velocity[2] * min(0.3, lead) - muzzle[2] - me["vel"][2] * firing_delay
             yaw, pitch = math.atan2(dy, dx), math.atan2(dz, math.hypot(dx, dy))
             act["aim"] = [yaw, pitch]
             aligned = (
@@ -1143,7 +1153,12 @@ class Bot:
             )
             pitch_error = max(0, abs(pitch - me["aim"][1]) - 0.05 * me["stats"]["pitch_rate"])
             beam_aligned = yaw_error * distance < 1.8 and pitch_error * distance < 3.5
-            fire_primary = aligned and distance < gun["stats"]["range"]
+            target_scale = 1 + enemy.get("cubes", 0) * self.config["cubes"]["size_per_cube"]
+            fire_primary = (
+                distance < gun["stats"]["range"]
+                and yaw_error * distance < 0.85 * self.config["mech"]["radius"] * target_scale
+                and pitch_error * distance < 0.4 * self.config["mech"]["height"]
+            )
             fire_secondary = False
             if laser and distance < second["stats"]["range"]:
                 fire_secondary = not (charging and second["charge"] >= threshold and beam_aligned)
