@@ -868,11 +868,6 @@ class Bot:
                 "gun_velocity",
                 "gyros",
             ]
-            # When armor is healthy, the next beam upgrade can shorten the
-            # interval during which a second hunter can join this engagement.
-            if secondary == "laser" and health > 0.72:
-                ranks.remove("laser_damage")
-                ranks.insert(1, "laser_damage")
             act["pick"] = min(
                 range(len(offer["choices"])),
                 key=lambda i: (
