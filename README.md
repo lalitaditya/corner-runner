@@ -6,6 +6,8 @@ A Python bot for Builders Mech Royale. The practice opponent is a squad of 15 me
 - **Once equipped** it looks for a lone opponent it can reach with its weapon, keeps the autocannon on the same target, and collects the dropped cubes when the approach looks clear. For a wounded opponent, it estimates the seconds needed to finish using magazine state, secondary cooldown, range and cube bonuses. It checks other tracked mechs’ aim, motion and projected sightlines before committing to a quick finish. After an elimination, it can collect a nearby cluster of visible cubes inside the zone, provided known opponents are far enough away. In a duel, the bot projects both its strafe and nearby lightning carriers’ movement over the next 0.8 seconds. It favors paths outside arc range when using its gun or laser, and can still close on its own lightning target.
 - **Between fights** it scouts while healthy and uses solid cover to recover when damaged. It drops its rooftop objective at 88% health and checks the next safe zone before continuing. Trees are traversable and can conceal movement at range. Buildings can also stop shots.
 
+At its first ground engagement with a laser already equipped, the bot strafes around the selected opponent and aims to maintain its initial distance for up to four seconds. An urgent zone rotation or recovery takes priority.
+
 ## Learned aiming
 
 The gun uses a small motion model fitted offline on opponent tracks from 32 local matches. For a given projectile flight time, the model estimates horizontal displacement from the opponent’s velocity and its change since the preceding observation. The runtime reads 36 pairs of coefficients from `lead_model.py`. The laser uses a separate hitscan calculation. Both run in standard-library Python.

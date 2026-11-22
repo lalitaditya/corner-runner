@@ -18,7 +18,7 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v7"
+    name = "Corner Runner v8"
     loot_range = 160
     staging_weight = 0.8
     opening_cubes = 3
@@ -58,6 +58,9 @@ class Bot:
         self.cube_memory = {}
         self.healing = False
         self.scanned = set()
+        self.first_opponent = None
+        self.opening_move_until = -1.0
+        self.opening_distance = 0.0
         self.next_step = -1
         self.saved_step = None
         self.step_enemy = None
@@ -223,6 +226,8 @@ class Bot:
         if desired > 50 and "lightning" not in foe["weapons"] and me["cubes"] < 9:
             if len(others) <= 1 and me["hp"] > 1.1 * foe.get("hp", 1400):
                 desired = 28 if foe.get("hp", 1400) < 500 else 70
+        if t < self.opening_move_until and foe["id"] == self.first_opponent:
+            desired = self.opening_distance
         # Estimate how close each visible arc carrier can get before the next turn.
         # A direct approach and a parallel strafe have different risks at the same range.
         arc_positions = []
@@ -420,6 +425,17 @@ class Bot:
             self.perched = True
         if self.perched and roof and p[2] >= roof[3] - 3:
             on_roof = True
+        # Decide once, at the first actionable ground engagement. The zone
+        # and an urgent recovery keep priority during this short intervention.
+        if targets and not on_roof and not self.healing:
+            foe, point = targets[0]
+            if self.first_opponent is None:
+                self.first_opponent = foe["id"]
+                if second and second["kind"] == "laser":
+                    self.opening_move_until = now + 4.0
+                    self.opening_distance = horizontal(p, point)
+            if now < self.opening_move_until and foe["id"] == self.first_opponent:
+                return self.ring_move(obs, targets)
         if (
             not on_roof
             and not targets
