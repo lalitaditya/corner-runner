@@ -18,7 +18,7 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v10"
+    name = "Corner Runner v12"
     loot_range = 160
     staging_weight = 0.8
     opening_cubes = 3
@@ -567,6 +567,16 @@ class Bot:
                         me["energy"] > 45,
                         False,
                     )
+        if targets and not on_roof and second and self.climb is None:
+            foe, point = targets[0]
+            distance = horizontal(p, point)
+            gap = self.finish_time(me, foe, distance)
+            recent_exchange = now - self.attackers.get(foe["id"], -99) < 3
+            in_range = sum(1 for _, other in exposed if horizontal(other, p) < 100)
+            if recent_exchange and gap < 7.5 and (in_range <= 1 or foe["hp"] < 350):
+                # Preserve contact across the final burst instead of detouring
+                # for other weapons or for dropped cubes.
+                return self.ring_move(obs, targets)
         if self.healing and eyes and not on_roof and health < 0.9:
             pts = [eye for _, eye in eyes]
             key = ("recover", *[i for i, _ in eyes], len(exposed))
@@ -768,6 +778,45 @@ class Bot:
         )
         return move, bool(exposed) and any(move) and me["energy"] > 24, False
 
+    def separate_from_squad(self, pos, move, target_id, now):
+        """Steer around other nearby opponents while keeping aim on the duel."""
+        near = self.config["vision"]["near_range"] + 6
+        neighbors = []
+        for opponent, seen in self.tracks.values():
+            if opponent["id"] == target_id or now - seen > 1:
+                continue
+            point = opponent["pos"]
+            if horizontal(pos, point) > near + 24 or abs(point[2] - pos[2]) > 14:
+                continue
+            velocity = opponent["vel"]
+            radius = near
+            neighbors.append((point[0] + 0.65 * velocity[0], point[1] + 0.65 * velocity[1], radius))
+        if not neighbors:
+            return move
+
+        def crowding(dx, dy):
+            x, y = pos[0] + dx * 13, pos[1] + dy * 13
+            return sum(max(0, radius - math.hypot(x - ex, y - ey)) for ex, ey, radius in neighbors)
+
+        best = crowding(*move)
+        if best <= 0:
+            return move
+        if any(move):
+            heading = math.atan2(move[1], move[0])
+        else:
+            x, y, _ = neighbors[0]
+            heading = math.atan2(pos[1] - y, pos[0] - x)
+        for turn in (0, 0.6, -0.6, 1.2, -1.2, 1.8, -1.8, 2.5, -2.5, math.pi):
+            dx, dy = math.cos(heading + turn), math.sin(heading + turn)
+            end = pos[0] + dx * 13, pos[1] + dy * 13
+            if not self.map.edges[self.map.cell(end)]:
+                continue
+            cost = crowding(dx, dy) + abs(turn) * 1.3
+            if cost < best:
+                best = cost
+                move = [dx, dy]
+        return move
+
     def act(self, obs):
         now, me = obs["t"], obs["self"]
         pos = me["pos"]
@@ -952,6 +1001,8 @@ class Bot:
         self.climb = None
         self.crate = None
         move, boost, jump = self.movement(obs, eyes[:3], exposed, health, targets)
+        if me["grounded"] and me["in_zone"] and not jump and self.climb is None:
+            move = self.separate_from_squad(pos, move, targets[0][0]["id"] if targets else None, now)
         if now - self.footing_at > 0.85:
             if (
                 me["grounded"]
@@ -980,6 +1031,16 @@ class Bot:
                 move, boost, jump = [0, 0], False, False
             else:
                 boost, jump = True, me["grounded"]
+        if exposed and self.climb is None and not self.perched and me["in_zone"]:
+            _, mark = targets[0] if targets else min(exposed, key=lambda pair: horizontal(pos, pair[1]))
+            distance = horizontal(pos, mark)
+            floor = self.map.floor[self.map.cell(pos)]
+            height = pos[2] - floor
+            if distance < 185 and me["weapons"][1] and me["weapons"][1]["kind"] == "laser":
+                if me["grounded"] and me["energy"] > 80:
+                    jump = True
+                if not me["grounded"]:
+                    boost = height < 45 and me["energy"] > 10
         gun, second = me["weapons"]
         act = {"tick": obs["tick"], "move": move, "boost": boost, "jump": jump}
         reachable = [

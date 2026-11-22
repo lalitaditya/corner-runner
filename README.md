@@ -12,6 +12,8 @@ Corner Runner keeps a short history of damage dealt to and received from each tr
 
 During a duel, it estimates when either weapon can deal damage again. It can move behind a wall during a reload, remember the firing position, and return there when a weapon is ready. It checks the aim and sightlines of up to two additional threats before choosing its next step.
 
+On the ground, the bot projects its next step and the movement of nearby opponents. If that step takes it close to a second mech, it looks for a clear direction that keeps the duel isolated. When already trading with a wounded opponent, it can stay in range through the last burst before returning to collect cubes. A well-charged mech carrying a laser can also jet during an exposed fight.
+
 ## Learned aiming
 
 The gun uses a small motion model fitted offline on opponent tracks from 32 local matches. For a given projectile flight time, the model estimates horizontal displacement from the opponent’s velocity and its change since the preceding observation. The runtime reads 36 pairs of coefficients from `lead_model.py`. The laser uses a separate hitscan calculation. Both run in standard-library Python.
