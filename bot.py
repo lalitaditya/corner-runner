@@ -2,6 +2,7 @@
 
 import math
 from arena import Arena
+from lead_model import offset
 import mechfight as mf
 
 
@@ -17,8 +18,8 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v2"
-    loot_range = 90
+    name = "Corner Runner v3"
+    loot_range = 160
     staging_weight = 0.8
     camp_after = 100
     cover_hp = 0.48
@@ -52,6 +53,7 @@ class Bot:
         self.salvage = None
         self.salvage_until = 0
         self.last_target = None
+        self.previous_velocity = {}
         self.cube_memory = {}
         self.healing = False
         self.scanned = set()
@@ -156,6 +158,9 @@ class Bot:
             return self.saved_step
         best, score = None, -math.inf
         desired = 31 if me["weapons"][1] and me["weapons"][1]["kind"] == "lightning" else self.duel_range
+        if desired > 50 and "lightning" not in foe["weapons"] and me["cubes"] < 9:
+            if len(others) <= 1 and me["hp"] > 1.1 * foe.get("hp", 1400):
+                desired = 28 if foe.get("hp", 1400) < 500 else 70
         for i in range(18):
             a = i * math.tau / 18
             dx, dy = math.cos(a), math.sin(a)
@@ -210,6 +215,27 @@ class Bot:
             self.scan_target = min(goals)[1] if goals else zone["next_center"]
             self.scan_time = now
         return self.follow(p, ("scout", *self.scan_target), now, lambda: self.map.travel(p, self.scan_target))
+
+    def farming_move(self, obs, obj):
+        me, q = obs["self"], obj["pos"]
+        p = me["pos"]
+        is_drone = obj.get("kind") == "npc"
+        aim_height = self.config["npc"]["height"] * 0.5 if is_drone else 1.3
+        drop = p[2] + me["stats"]["muzzle_height"] - (q[2] + aim_height)
+        # Leave a few meters for braking before the target passes below the gun's pitch limit.
+        spacing = max(10, drop / max(0.1, math.tan(-me["stats"]["min_pitch"])) + 5)
+        distance = horizontal(p, q)
+        if distance < spacing - 2:
+            away = toward(q, p, 0.01)
+            if not any(away):
+                away = [math.cos(me["aim"][0]), math.sin(me["aim"][0])]
+            return away, False, False
+        if distance < spacing + 4:
+            return [0, 0], False, False
+        if distance < 30 and self.map.shot_clear((*p[:2], p[2] + 2), (*q[:2], q[2] + 2)):
+            return toward(p, q), False, False
+        key = ("drone" if is_drone else "box", obj["id"])
+        return self.follow(p, key, obs["t"], lambda: self.map.travel(p, q)), False, False
 
     def movement(self, obs, eyes, exposed, health, targets):
         me, zone, now = obs["self"], obs["zone"], obs["t"]
@@ -278,7 +304,7 @@ class Bot:
             for item, seen in self.items.values():
                 q = item["pos"]
                 distance = horizontal(p, q)
-                if abs(p[2] - q[2]) > 4 or item["kind"] not in allowed:
+                if abs(p[2] - q[2]) > 13 or item["kind"] not in allowed:
                     continue
                 if second and item["kind"] != "laser":
                     continue
@@ -305,7 +331,7 @@ class Bot:
                     return move, me["energy"] > 52, False
 
         fresh_cube = None
-        if not on_roof and me["cubes"] < 12 and health > 0.47:
+        if not on_roof and me["cubes"] < 14 and health > 0.28:
             options = [
                 (horizontal(p, c["pos"]), id, c["pos"])
                 for id, (c, _) in self.cube_memory.items()
@@ -315,11 +341,20 @@ class Bot:
                 _, _, fresh_cube = min(options)
             elif self.salvage and now < self.salvage_until and abs(self.salvage[2] - p[2]) < 4:
                 fresh_cube = self.salvage
+            if fresh_cube and any(
+                horizontal(foe["pos"], fresh_cube) < (65 if "lightning" in foe["weapons"] else 36)
+                and horizontal(p, fresh_cube) > 8
+                and horizontal(foe["pos"], fresh_cube) < horizontal(foe["pos"], p)
+                for foe, _ in exposed
+            ):
+                fresh_cube = None
             if fresh_cube and (
                 not targets
-                or horizontal(p, fresh_cube) < 18
+                or horizontal(p, fresh_cube) < 35
                 or min(horizontal(p, q) for _, q in targets) > 58
             ):
+                if self.salvage and fresh_cube == self.salvage and horizontal(p, fresh_cube) < 4:
+                    self.salvage = None
                 if horizontal(p, fresh_cube) < 12:
                     return toward(p, fresh_cube, 1), False, False
                 move = self.follow(
@@ -327,26 +362,19 @@ class Bot:
                 )
                 if any(move):
                     return move, me["energy"] > 45, False
-        if not on_roof and not targets and health > 0.62 and me["cubes"] < self.farm_cap:
+        if not on_roof and not targets and health > 0.56 and me["cubes"] < 10:
             drones = [
                 n
                 for n in obs["mechs"]
                 if n["kind"] == "npc"
-                and horizontal(p, n["pos"]) < 75
+                and horizontal(p, n["pos"]) < (100 if me["cubes"] < 3 else 45)
                 and self.map.clear((*p[:2], p[2] + 7), (*n["pos"][:2], n["pos"][2] + 1.8))
             ]
             if drones:
                 drone = min(drones, key=lambda n: horizontal(p, n["pos"]))
                 self.crate = drone
-                q = drone["pos"]
-                if horizontal(p, q) < 16:
-                    return toward(p, q, 7), False, False
-                return (
-                    self.follow(p, ("drone", drone["id"]), now, lambda: self.map.travel(p, q)),
-                    False,
-                    False,
-                )
-        if targets and not on_roof and health > 0.35 and len(targets) < 4 and now >= self.withdraw_until:
+                return self.farming_move(obs, drone)
+        if targets and not on_roof and health > 0.22 and len(targets) < 4 and now >= self.withdraw_until:
             return self.ring_move(obs, targets)
         self.crate = None
         if not on_roof and not targets and me["cubes"] < self.farm_cap:
@@ -371,8 +399,7 @@ class Bot:
                     box = min(crates, key=lambda c: horizontal(c["pos"], p))
                     if self.map.clear((*p[:2], p[2] + 7), (*box["pos"][:2], box["pos"][2] + 1.4)):
                         self.crate = box
-                        q = box["pos"]
-                        return toward(p, q, 10), False, False
+                        return self.farming_move(obs, box)
 
         if not roof and not targets and health > 0.66 and now < self.camp_after:
             return self.scout(obs), me["energy"] > 72, False
@@ -442,11 +469,13 @@ class Bot:
         for e in obs["events"]:
             if e["type"] == "damaged" and e.get("by") is not None:
                 self.attackers[e["by"]] = now
+            if e["type"] == "hit" and e.get("target") in self.tracks:
+                self.attackers[e["target"]] = now
             if e["type"] == "kill":
                 track = self.tracks.pop(e["target"], None)
                 if track:
                     self.salvage = track[0]["pos"]
-                    self.salvage_until = now + 8
+                    self.salvage_until = now + 16
             if e["type"] in ("took", "take_failed"):
                 self.items.pop(e["id"], None)
         self.cube_memory.update({c["id"]: (c, now) for c in obs["cubes"]})
@@ -498,7 +527,7 @@ class Bot:
             opportunities = []
             for foe, q in exposed:
                 distance = horizontal(pos, q)
-                if distance > 180:
+                if distance > 125:
                     continue
                 facing = math.cos(math.atan2(pos[1] - q[1], pos[0] - q[0]) - foe["aim"][0])
                 vulnerable = foe.get("hp", 1400) < 530 or (
@@ -511,16 +540,29 @@ class Bot:
                 if vulnerable and isolated:
                     opportunities.append((foe, q))
             targets = opportunities
-        targets.sort(
-            key=lambda pair: (
-                0.055 * pair[0].get("hp", 1400)
-                + horizontal(pos, pair[1])
-                - (24 if pair[0]["id"] == self.last_target else 0)
+
+        def removal_cost(pair):
+            enemy, point = pair
+            dist = horizontal(pos, point)
+            direction = math.atan2(pos[1] - point[1], pos[0] - point[0])
+            rear = abs(math.remainder(direction - enemy["aim"][0], math.tau)) > math.pi / 2
+            efficiency = 1 + 0.4 * rear
+            if second and second["kind"] == "laser" and "mortar" in enemy["weapons"]:
+                efficiency += 0.45
+            return (
+                enemy.get("hp", 1400) / efficiency
+                + 2 * dist
+                - (165 if enemy["id"] == self.last_target else 0)
             )
-        )
+
+        targets.sort(key=removal_cost)
         self.last_target = targets[0][0]["id"] if targets else None
         if self.healing and now - self.last_hit > 1.1:
-            targets = [pair for pair in targets if horizontal(pos, pair[1]) < 30]
+            targets = [
+                pair
+                for pair in targets
+                if horizontal(pos, pair[1]) < 30 or pair[0].get("hp", 1400) < me["hp"] * 0.42
+            ]
         self.climb = None
         self.crate = None
         move, boost, jump = self.movement(obs, eyes[:3], exposed, health, targets)
@@ -587,20 +629,52 @@ class Bot:
                     else len(ranks)
                 ),
             )
+        if not self.crate and not targets and not self.healing and me["cubes"] < 10:
+            # The torso can track a crate or drone independently of movement.
+            nearby = []
+            for obj in (*obs["crates"], *obs["mechs"]):
+                if obj.get("kind") == "mech":
+                    continue
+                q = obj["pos"]
+                d = horizontal(pos, q)
+                if d > (80 if obj.get("kind") == "npc" else 55):
+                    continue
+                if obj.get("kind") == "npc" and d > 42 and now - self.attackers.get(obj["id"], -99) > 2:
+                    continue
+                if self.map.shot_clear(muzzle, (*q[:2], q[2] + 1.5)):
+                    angle = math.atan2(q[1] - pos[1], q[0] - pos[0])
+                    nearby.append(
+                        (d + 12 * abs(math.remainder(angle - me["aim"][0], math.tau)), obj["id"], obj)
+                    )
+            if nearby:
+                self.crate = min(nearby)[2]
         if targets:
             enemy, target = targets[0]
             velocity = enemy["vel"]
             distance = math.dist(muzzle, target)
             laser = second and second["kind"] == "laser"
             charging = laser and second.get("charge", 0) > 0
-            beam_aim = charging and second["charge"] + 0.11 >= second["stats"]["charge"]
-            lead = 0.05 if beam_aim else 0.05 + distance / gun["stats"]["speed"]
-            if not beam_aim:
-                predicted = [target[j] + velocity[j] * lead for j in range(3)]
-                lead = 0.05 + math.dist(muzzle, predicted) / gun["stats"]["speed"]
-            dx, dy, dz = (
-                v + velocity[j] * lead - muzzle[j] - me["vel"][j] * 0.05 for j, v in enumerate(target)
+            frame = 1 / self.config["match"]["tick_hz"]
+            threshold = second["stats"]["charge"] if laser else math.inf
+            if laser:
+                minimum = second["stats"].get("min_frac", 0.35)
+                cube_bonus = 1 + self.config["cubes"]["damage_per_cube"] * min(
+                    me["cubes"], self.config["cubes"]["stat_cap"]
+                )
+                damage = second["stats"]["damage"] * cube_bonus * (1.6 if "mortar" in enemy["weapons"] else 1)
+                needed = (1.15 * enemy.get("hp", 1400) / damage - minimum) / (1 - minimum)
+                threshold *= min(1, max(0.28, needed))
+            beam_aim = charging and second["charge"] + 0.10 >= threshold
+            lead = frame if beam_aim else frame + distance / gun["stats"]["speed"]
+            prev = self.previous_velocity.get(enemy["id"])
+            previous = prev[1] if prev and 0 < now - prev[0] < 0.15 else None
+            self.previous_velocity[enemy["id"]] = now, velocity[:]
+            tx, ty = (
+                (lead * velocity[0], lead * velocity[1]) if beam_aim else offset(velocity, previous, lead)
             )
+            dx = target[0] + tx - muzzle[0] - me["vel"][0] * frame
+            dy = target[1] + ty - muzzle[1] - me["vel"][1] * frame
+            dz = target[2] + velocity[2] * min(0.25, lead) - muzzle[2] - me["vel"][2] * frame
             yaw, pitch = math.atan2(dy, dx), math.atan2(dz, math.hypot(dx, dy))
             act["aim"] = [yaw, pitch]
             aligned = (
@@ -614,9 +688,7 @@ class Bot:
             fire_primary = aligned and distance < gun["stats"]["range"]
             fire_secondary = False
             if laser and distance < second["stats"]["range"]:
-                fire_secondary = not (
-                    charging and second["charge"] >= second["stats"]["charge"] - 0.05 and beam_aligned
-                )
+                fire_secondary = not (charging and second["charge"] >= threshold and beam_aligned)
             elif second:
                 fire_secondary = aligned and distance < second["stats"]["range"] and me["energy"] > 8
             if self.risk_to_bystander(
@@ -645,8 +717,8 @@ class Bot:
                 abs(math.remainder(yaw - me["aim"][0], math.tau)) < 0.07 and abs(pitch - me["aim"][1]) < 0.07
             )
             alt = False
-            if laser:
-                alt = not (second.get("charge", 0) >= second["stats"]["charge"] * 0.95 and aligned)
+            if laser and (is_drone or gun["ammo"] < 6):
+                alt = not (second.get("charge", 0) >= second["stats"]["charge"] and aligned)
             elif second and second["kind"] == "lightning" and distance < 40 and me["energy"] > 30:
                 alt = aligned
             act["aim"] = [yaw, pitch]
