@@ -6003,7 +6003,7 @@ class loot:
 
 def DefaultParams():
     return Params(
-        Name="mech-royal-lalit",
+        Name="mech-royal",
         EngageRatio=1.25,
         DisengageRat=0.75,
         RetreatHP=0.45,
