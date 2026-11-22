@@ -12,10 +12,6 @@ Corner Runner keeps a short history of damage dealt to and received from each tr
 
 During a duel, it estimates when either weapon can deal damage again. It can move behind a wall during a reload, remember the firing position, and return there when a weapon is ready. It checks the aim and sightlines of up to two additional threats before choosing its next step.
 
-## Strategy reference
-
-We compared Corner Runner with the public Apex-Go bot on identical local starts. That comparison informed the focus on acquiring a secondary early, evaluating damage trades, and using weapon downtime to move behind cover. Corner Runner implements its own policy in Python. [Apex-Go benchmark revision](https://github.com/ahmad-ovh/Buildathon/tree/a484109a70db447abd390ffe871c32026cd15d7e)
-
 ## Learned aiming
 
 The gun uses a small motion model fitted offline on opponent tracks from 32 local matches. For a given projectile flight time, the model estimates horizontal displacement from the opponent’s velocity and its change since the preceding observation. The runtime reads 36 pairs of coefficients from `lead_model.py`. The laser uses a separate hitscan calculation. Both run in standard-library Python.
