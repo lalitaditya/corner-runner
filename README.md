@@ -1,33 +1,40 @@
-# Corner Runner
+# Mech Royale
 
-A Python bot for Builders Mech Royale. The practice opponent is a squad of 15 mechs with shared vision. Corner Runner uses the opening to build enough health and damage to take an isolated fight.
+A Python port of the Mech Royale decision engine at [revision a484109](https://github.com/ahmad-ovh/Buildathon/tree/a484109a70db447abd390ffe871c32026cd15d7e). The container runs the Python policy for every observation. A compiled Cython extension accelerates geometric queries and pathfinding on the campus map.
 
-- **At spawn** it ranks loose cubes, weapon pickups, crates and drones by their travel time, time to destroy, and proximity to known opponents. A secondary weapon near a source of cubes makes the trip more attractive. If a laser or lightning pickup is within 100 m on the same level and inside the zone, the opening planner gives the weapon priority over farming. It then seeks three cubes for the first two upgrade offers. An approaching attacker or the closing zone can interrupt that route.
-- **Once equipped** it looks for a lone opponent it can reach with its weapon, keeps the autocannon on the same target, and collects the dropped cubes when the approach looks clear. For a wounded opponent, it estimates the seconds needed to finish using magazine state, secondary cooldown, range and cube bonuses. It checks other tracked mechs’ aim, motion and projected sightlines before committing to a quick finish. After an elimination, it can collect a nearby cluster of visible cubes inside the zone, provided known opponents are far enough away. Above the cube combat-stat cap it can collect a nearby pile when the trip buys another upgrade and the approach is clear. In a duel, the bot projects both its strafe and nearby lightning carriers’ movement over the next 0.8 seconds. It favors paths outside arc range when using its gun or laser, and can still close on its own lightning target.
-- **Between fights** it scouts while healthy and uses solid cover to recover when damaged. It drops its rooftop objective at 88% health and checks the next safe zone before continuing. Trees are traversable and can conceal movement at range. Buildings can also stop shots.
+## Build and run
 
-If the mech still has an empty slot after 27 seconds, it can take a nearby mortar. It checks the shell trajectory against the map, rejects shots that put its own mech inside the blast area, and can aim over cover at a recently tracked attacker. It can exchange the mortar for a laser or lightning pickup.
+Build for the scoring platform:
 
-## Fighting from a corner
+```sh
+docker build --platform linux/amd64 -t mech-royale-python .
+```
 
-The bot ranks eligible opponents by the time to turn and finish, expected incoming damage, and distance to the dropped cubes. When two opponents are fighting, a visible beam ending on a mech that just lost armor can reveal a brief finishing shot.
+From the organizer’s extracted kit directory, exercise the normal entry point under the competition limits:
 
-Corner Runner keeps a short history of damage dealt to and received from each tracked opponent. It uses the armor left on both mechs and damage from other shooters to decide whether to trade another burst or seek cover. When a wounded opponent breaks sight, the bot can pursue briefly if the approach stays in the zone and nearby enemies cannot cover it.
+```sh
+python3 check/check.py --map-dir /arena -- docker run --rm -i \
+  --platform linux/amd64 --cpus 1 --memory 512m --memory-swap 512m \
+  --network none --cap-drop ALL --pids-limit 128 --read-only --user 65534:65534 \
+  --tmpfs /tmp:rw,size=64m -v "$PWD/arena:/arena:ro" mech-royale-python
+```
 
-During a duel, it estimates when either weapon can deal damage again. It can move behind a wall during a reload, remember the firing position, and return there when a weapon is ready. It checks the aim and sightlines of up to two additional threats before choosing its next step.
+From this repository, replay all 300 actions in the kit recording and compare their digest with the reference engine:
 
-On the ground, the bot projects its next step and the movement of nearby opponents. If that step takes it close to a second mech, it looks for a clear direction that keeps the duel isolated. When already trading with a wounded opponent, it can stay in range through the last burst before returning to collect cubes. A well-charged mech carrying a laser can also jet during an exposed fight.
+```sh
+python3 tools/check_decisions.py /path/to/mechfight-kit
+```
 
-## Learned aiming
+## Implementation
 
-The gun uses a small motion model fitted offline on opponent tracks from 32 local matches. For a given projectile flight time, the model estimates horizontal displacement from the opponent’s velocity and its change since the preceding observation. The runtime reads 36 pairs of coefficients from `lead_model.py`. The laser uses a separate hitscan calculation. Both run in standard-library Python.
+- `bot.py` reads the JSON-lines stream, initializes the match and dispatches the newest observation to the engine.
+- `decisions.py` implements match memory, target selection, firing and reload timing, movement, cover, roof access, equipment and upgrades. Its default gameplay parameters match the pinned revision.
+- `protocol.py` decodes game messages and serializes actions at the reference engine’s movement and aiming precision.
+- `world.py` and `spatial.pyx` implement terrain, obstacles, tree crowns and navigation. The map fingerprint determines whether the precomputed campus data applies.
+- `gorandom.py` reproduces the reference random stream for the match seed and slot.
 
-## Run the bot
-
-Build the top-level Dockerfile with `docker build --platform linux/amd64 -t corner-runner .`. The container expects the organizer’s map at `/arena` and communicates over standard input and output. The protocol wrapper in `mechfight.py` comes from the Builders starter kit. See the [competition protocol](https://www.joinbuilders.org/buildathon/tracks/builders/files/protocol.md?inline=1) for the official container check.
+The Docker build uses Cython and setuptools. The policy port’s notice is in `licenses/engine-MIT.txt`. The random number generator’s notice is in `licenses/Go-BSD.txt`.
 
 ## Record a public practice room
 
-With Chrome and uv installed, run `./tools/observe.py --seconds 120`. Use `--room 21` to join a particular public room. The script opens an interactive Chrome window, enters a nickname and joins automatically. The first visit downloads campus graphics, which can take a minute or more.
-
-Each run writes a timestamped folder under `~/Videos/MechRoyale`. The JSON lines contain visible HUD text, clock readings and screenshot filenames. When the HUD displays an alive count, a decrease saves a before/after pair. During a match with the count hidden, the recorder saves an overview every five seconds. The browser tool runs separately from the competition container.
+With Chrome and uv installed, run `./tools/observe.py --seconds 120`. Use `--room 21` to join a particular public room. Recordings are written under `~/Videos/MechRoyale`. This tool runs separately from the competition container.
