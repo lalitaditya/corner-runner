@@ -18,7 +18,7 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v4"
+    name = "Corner Runner v5"
     loot_range = 160
     staging_weight = 0.8
     opening_cubes = 3
@@ -149,6 +149,67 @@ class Bot:
             ):
                 return True
         return False
+
+    def finish_time(self, me, foe, distance):
+        """Estimate seconds of clear fire, allowing for the current magazine and secondary."""
+        gun, secondary = me["weapons"]
+        stats = gun["stats"]
+        # Spread and target movement make long bursts less reliable at range.
+        hit_rate = max(0.32, 0.88 - distance / 320)
+        gun_rate = stats["damage"] * hit_rate / stats["cooldown"] if distance < stats["range"] else 0
+        bonus = 1 + self.config["cubes"]["damage_per_cube"] * min(
+            me["cubes"], self.config["cubes"]["stat_cap"]
+        )
+        hp = foe["hp"] / bonus
+        secondary_rate = 0
+        delay = 0
+        if secondary and distance < secondary["stats"]["range"]:
+            weapon = secondary["stats"]
+            if secondary["kind"] == "laser":
+                cycle = weapon["charge"] + weapon["cooldown"]
+                damage = weapon["damage"] * (1 + weapon["cookoff"] * ("mortar" in foe["weapons"]))
+                secondary_rate = damage * 0.8 / cycle
+                delay = secondary["cooldown"] + max(0, weapon["charge"] - secondary.get("charge", 0))
+            elif secondary["kind"] == "lightning" and me["energy"] >= weapon["energy"]:
+                secondary_rate = weapon["damage"] * 0.85 / weapon["cooldown"]
+                delay = secondary["cooldown"]
+        burst = hp / max(1, gun_rate + secondary_rate)
+        if burst > gun["ammo"] * stats["cooldown"] or gun["reload"] > 0:
+            gun_rate *= (
+                stats["mag"] * stats["cooldown"] / (stats["mag"] * stats["cooldown"] + stats["reload"])
+            )
+        rate = max(1, gun_rate + secondary_rate)
+        return (hp + gun_rate * gun["reload"] + secondary_rate * delay) / rate
+
+    def reinforcement_time(self, obs, foe_id):
+        """Earliest plausible clear shot from another recently observed mech."""
+        me, now = obs["self"], obs["t"]
+        p = me["pos"]
+        center = (*p[:2], p[2] + me["stats"]["eye_height"])
+        earliest = math.inf
+        for other, seen in self.tracks.values():
+            if other["id"] == foe_id or now - seen > 1:
+                continue
+            q = other["pos"]
+            distance = horizontal(p, q)
+            if distance > 185:
+                continue
+            yaw = math.atan2(p[1] - q[1], p[0] - q[0])
+            turn = abs(math.remainder(yaw - other["aim"][0], math.tau)) / self.config["mech"]["turn_rate"]
+            towards = other["vel"][0] * math.cos(yaw) + other["vel"][1] * math.sin(yaw)
+            alerted = now - self.attackers.get(other["id"], -100) < 4 or other.get("charging")
+            if not alerted and towards < 2 and turn > 0.16:
+                continue
+            scale = 1 + other.get("cubes", 0) * self.config["cubes"]["size_per_cube"]
+            height = self.config["mech"]["muzzle_height"] * scale
+            for lead in (0, 1, 2.5):
+                if lead >= earliest:
+                    break
+                eye = (q[0] + other["vel"][0] * lead, q[1] + other["vel"][1] * lead, q[2] + height)
+                if self.map.shot_clear(eye, center):
+                    earliest = min(earliest, max(turn, lead))
+                    break
+        return earliest
 
     def ring_move(self, obs, targets):
         me, zone, t = obs["self"], obs["zone"], obs["t"]
@@ -375,6 +436,43 @@ class Bot:
             )
             if any(move) or not exposed:
                 return move, any(move) and me["energy"] > 20, False
+        if targets and not self.healing and not on_roof and health > 0.45:
+            foe, point = targets[0]
+            if foe["hp"] < 550:
+                finish = self.finish_time(me, foe, horizontal(p, point))
+                if finish < 2.2 and finish <= self.reinforcement_time(obs, foe["id"]) + 0.6:
+                    return self.ring_move(obs, targets)
+
+        # An elimination can leave a close group of cubes. During the short
+        # salvage window, value the group and check whether a rival can contest it.
+        if self.salvage and now < self.salvage_until and not on_roof and health > 0.5 and me["cubes"] < 21:
+            nearby = sorted(
+                (
+                    cube
+                    for cube in obs["cubes"]
+                    if horizontal(p, cube["pos"]) <= 48
+                    and abs(p[2] - cube["pos"][2]) <= 4
+                    and horizontal(self.salvage, cube["pos"]) <= 26
+                    and horizontal(cube["pos"], zone["center"]) + 3 < zone["radius"]
+                ),
+                key=lambda cube: horizontal(p, cube["pos"]),
+            )[:16]
+            if len(nearby) >= 2:
+                options = []
+                for cube in nearby:
+                    q = cube["pos"]
+                    travel = horizontal(p, q)
+                    if any(horizontal(q, eye) < max(38, travel + 12) for _, eye in eyes):
+                        continue
+                    count = sum(horizontal(q, other["pos"]) < 9 for other in nearby)
+                    options.append((travel - min(count, 6) * 2.5, cube["id"], q))
+                if options:
+                    _, ident, q = min(options)
+                    if horizontal(p, q) < 10:
+                        return toward(p, q, 1), False, False
+                    move = self.follow(p, ("pile", ident), now, lambda: self.map.travel(p, q))
+                    if any(move):
+                        return move, me["energy"] > 55, False
         allowed = ("laser", "lightning")
         # A reachable secondary is worth a short opening detour, before committing to a perch.
         arc_duel = (
@@ -649,6 +747,11 @@ class Bot:
                 if foe.get("hp", 1400) > me["hp"] * 1.05:
                     continue
                 isolated = all(other["id"] == foe["id"] or horizontal(pos, q) > 175 for other, q in exposed)
+                # A second mech in view may be screened, facing away, or too
+                # late to save a damaged teammate. Allow a short finishing window.
+                if not isolated and foe["hp"] < 0.65 * me["hp"]:
+                    finish = self.finish_time(me, foe, distance)
+                    isolated = finish < 3.5 and finish <= self.reinforcement_time(obs, foe["id"]) + 0.6
                 if isolated:
                     targets.append((foe, point))
 
