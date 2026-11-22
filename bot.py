@@ -18,10 +18,11 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v3"
+    name = "Corner Runner v4"
     loot_range = 160
     staging_weight = 0.8
-    camp_after = 100
+    opening_cubes = 3
+    opening_seconds = 70
     cover_hp = 0.48
     farm_cap = 16
     loot_memory = 65
@@ -237,6 +238,69 @@ class Bot:
         key = ("drone" if is_drone else "box", obj["id"])
         return self.follow(p, key, obs["t"], lambda: self.map.travel(p, q)), False, False
 
+    def opening_goal(self, obs, eyes):
+        """Rank nearby supplies by travel, work and risk per expected benefit."""
+        me, zone = obs["self"], obs["zone"]
+        p, now = me["pos"], obs["t"]
+        speed = me["stats"]["walk_speed"]
+        second = me["weapons"][1]
+        candidates = []
+        weapons = [
+            obj
+            for obj, seen in self.items.values()
+            if now - seen < 12 and obj["kind"] in ("laser", "lightning")
+        ]
+        cubes = [obj for obj, seen in self.cube_memory.values() if now - seen < 3]
+        boxes = obs["crates"]
+        drones = [obj for obj in obs["mechs"] if obj["kind"] == "npc"]
+        if not second:
+            for obj in weapons:
+                candidates.append(("kit", obj, 3.9 if obj["kind"] == "laser" else 2.9, 0))
+        if me["cubes"] < self.opening_cubes:
+            for obj in cubes:
+                candidates.append(("cube", obj, 1.5, 0))
+            for obj in boxes:
+                candidates.append(("box", obj, 1.2 if second else 2.2, obj.get("hp", 300) / 150))
+            for obj in drones:
+                candidates.append(("drone", obj, 2.1, obj.get("hp", 350) / 150))
+        best, best_cost = None, math.inf
+        for kind, obj, value, work in candidates:
+            q = obj["pos"]
+            distance = horizontal(p, q)
+            if distance > (150 if kind == "kit" else 90) or abs(p[2] - q[2]) > 5:
+                continue
+            if horizontal(q, zone["center"]) > zone["radius"] - 5:
+                continue
+            if kind not in ("kit", "cube") and not self.map.clear((*p[:2], p[2] + 7), (*q[:2], q[2] + 1.7)):
+                continue
+            nearest = min(
+                (horizontal(eye, q) for _, eye in eyes if horizontal(p, eye) > horizontal(eye, q)),
+                default=200,
+            )
+            if nearest < 32 and distance > 12:
+                continue
+            # A short second pickup makes this approach more valuable than an isolated item.
+            if kind == "kit" and any(horizontal(q, other["pos"]) < 27 for other in (*cubes, *boxes)):
+                value += 0.8
+            if kind != "kit" and not second and any(horizontal(q, other["pos"]) < 27 for other in weapons):
+                value += 0.8
+            cost = (distance / speed + work + 0.3 + max(0, 78 - nearest) * 0.09) / value
+            if cost < best_cost:
+                best_cost, best = cost, (kind, obj)
+        if best is None:
+            return None
+        kind, obj = best
+        q = obj["pos"]
+        if kind in ("box", "drone"):
+            self.crate = obj
+            return self.farming_move(obs, obj)
+        if horizontal(p, q) < 10:
+            return toward(p, q, 1), False, False
+        move = self.follow(p, ("opening", kind, obj["id"]), now, lambda: self.map.travel(p, q))
+        if any(move):
+            return move, me["energy"] > 45, False
+        return None
+
     def movement(self, obs, eyes, exposed, health, targets):
         me, zone, now = obs["self"], obs["zone"], obs["t"]
         p = me["pos"]
@@ -254,6 +318,9 @@ class Bot:
                 move = toward(p, center)
             return move, any(move) and me["grounded"] and me["energy"] > 12, False
 
+        if health >= 0.88:
+            self.roof = None
+            self.perched = False
         roof = self.roof
         on_roof = (
             roof
@@ -270,6 +337,17 @@ class Bot:
             self.perched = True
         if self.perched and roof and p[2] >= roof[3] - 3:
             on_roof = True
+        if (
+            not on_roof
+            and not targets
+            and not self.healing
+            and health > 0.58
+            and now < self.opening_seconds
+            and (not second or me["cubes"] < self.opening_cubes)
+        ):
+            opening = self.opening_goal(obs, eyes)
+            if opening is not None:
+                return opening
         # A visible solo supply drop gives a complete reset and a guaranteed upgrade.
         if not on_roof and not targets:
             for drop in obs["drops"]:
@@ -299,7 +377,12 @@ class Bot:
                 return move, any(move) and me["energy"] > 20, False
         allowed = ("laser", "lightning")
         # A reachable secondary is worth a short opening detour, before committing to a perch.
-        if not on_roof and (not second or second["kind"] != "laser") and health > 0.55:
+        arc_duel = (
+            second
+            and second["kind"] == "lightning"
+            and any(horizontal(p, q) <= second["stats"]["range"] + 14 for _, q in targets)
+        )
+        if not arc_duel and not on_roof and (not second or second["kind"] != "laser") and health > 0.55:
             candidates = []
             for item, seen in self.items.values():
                 q = item["pos"]
@@ -401,9 +484,9 @@ class Bot:
                         self.crate = box
                         return self.farming_move(obs, box)
 
-        if not roof and not targets and health > 0.66 and now < self.camp_after:
+        if not roof and not targets and health > 0.66 and (not self.healing or health >= 0.88):
             return self.scout(obs), me["energy"] > 72, False
-        if not roof and now >= self.next_roof and (now >= self.camp_after or health < 0.58):
+        if not roof and now >= self.next_roof and health < 0.58:
             roof = self.pick_perch(p, zone, now)
             self.roof = roof
             self.perched = False
@@ -523,7 +606,13 @@ class Bot:
             targets = [
                 pair for pair in exposed if pair[0].get("hp", 1400) < 330 and horizontal(pos, pair[1]) < 160
             ]
-        if not targets and second and not self.healing and health > 0.72:
+        if (
+            not targets
+            and second
+            and not self.healing
+            and health > 0.72
+            and (me["cubes"] >= self.opening_cubes or now >= self.opening_seconds or obs["alive"] < 13)
+        ):
             opportunities = []
             for foe, q in exposed:
                 distance = horizontal(pos, q)
@@ -540,6 +629,28 @@ class Bot:
                 if vulnerable and isolated:
                     opportunities.append((foe, q))
             targets = opportunities
+
+        # Start a duel on our own terms once equipped. Other known opponents
+        # must be too far away or screened by solid geometry at this position.
+        if (
+            not targets
+            and second
+            and health > 0.82
+            and not self.healing
+            and me["cubes"] >= self.opening_cubes
+        ):
+            arc = second["kind"] == "lightning"
+            for foe, point in exposed:
+                distance = horizontal(pos, point)
+                if distance > (second["stats"]["range"] - 2 if arc else 155):
+                    continue
+                if "lightning" in foe["weapons"] and not arc and distance < 68:
+                    continue
+                if foe.get("hp", 1400) > me["hp"] * 1.05:
+                    continue
+                isolated = all(other["id"] == foe["id"] or horizontal(pos, q) > 175 for other, q in exposed)
+                if isolated:
+                    targets.append((foe, point))
 
         def removal_cost(pair):
             enemy, point = pair
@@ -611,15 +722,26 @@ class Bot:
                 break
         offer = obs.get("offer")
         if offer:
+            # A fresh magazine or a working lightning arc can decide whether
+            # the lead pursuer falls before another arrives.
+            secondary = second["kind"] if second else None
+            specialty = {
+                "laser": ["laser_damage", "laser_charge"],
+                "lightning": ["lightning_efficiency", "lightning_range"],
+            }.get(secondary, [])
             ranks = [
                 "plating",
-                "armor",
                 "nanites",
-                "laser_damage",
-                "gun_damage",
+                "armor",
                 "gun_mag",
+                *specialty,
+                "gun_damage",
+                "servos",
                 "gun_rate",
                 "jets",
+                "reactor",
+                "gun_velocity",
+                "gyros",
             ]
             act["pick"] = min(
                 range(len(offer["choices"])),

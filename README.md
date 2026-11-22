@@ -1,6 +1,10 @@
 # Corner Runner
 
-A Python bot for Builders Mech Royale. It searches for a secondary weapon, collects cubes from reachable crates and drones, and finishes isolated opponents it has already damaged. It backs away when its gun cannot tilt down far enough to hit a nearby drone. When opponents close in or armor falls, it looks for a building corner or roof that screens it from the nearest threats. Dense tree cover is traversable and can help conceal an approach.
+A Python bot for Builders Mech Royale. The practice opponent is a squad of 15 mechs with shared vision. Corner Runner uses the opening to build enough health and damage to take an isolated fight.
+
+- **At spawn** it ranks loose cubes, weapon pickups, crates and drones by their travel time, time to destroy, and proximity to known opponents. A secondary weapon near a source of cubes makes the trip more attractive. Its first target is a laser or lightning weapon plus three cubes, which reach the first two upgrade offers. An approaching attacker or the closing zone can interrupt that route.
+- **Once equipped** it looks for a lone opponent it can reach with its weapon, keeps the autocannon on the same target, and collects the dropped cubes when the approach looks clear. It can finish an already weakened opponent sooner. Upgrade choices account for the weapon currently equipped.
+- **Between fights** it scouts while healthy and uses solid cover to recover when damaged. It drops its rooftop objective at 88% health and checks the next safe zone before continuing. Trees are traversable and can conceal movement at range. Buildings can also stop shots.
 
 ## Learned aiming
 
