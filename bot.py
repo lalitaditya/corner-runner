@@ -18,7 +18,8 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v12"
+    name = "Corner Runner v13"
+    mortar_wait = 27
     loot_range = 160
     staging_weight = 0.8
     opening_cubes = 3
@@ -35,6 +36,7 @@ class Bot:
         self.config = hello["config"]
         self.reach = self.config["loot"]["pickup_radius"]
         self.tracks = {}
+        self.crossfire = {}
         self.exchanges = {}
         self.items = {}
         self.roof = None
@@ -154,6 +156,84 @@ class Bot:
                 return True
         return False
 
+    @staticmethod
+    def mortar_envelope(stats):
+        """Conservative horizontal reach on level ground, in arena units."""
+        return min(stats["speed"] * stats["ttl"], stats["speed"] ** 2 / stats["gravity"])
+
+    def mortar_solution(self, me, muzzle, target, velocity):
+        """Find the first unobstructed simulated arc the torso can actually reach."""
+        stats = me["weapons"][1]["stats"]
+        speed, gravity = stats["speed"], stats["gravity"]
+        splash = stats["splash_radius"]
+        distance = horizontal(muzzle, target)
+        if distance < 2 * splash + 5 or distance > self.mortar_envelope(stats):
+            return None
+        tick = 1 / self.config["match"]["tick_hz"]
+        mx, my, mz = muzzle
+
+        def launch(flight):
+            x = target[0] + velocity[0] * (flight + tick) - mx
+            y = target[1] + velocity[1] * (flight + tick) - my
+            z = target[2] + velocity[2] * min(0.25, flight) - mz
+            # The arena advances gravity once before moving each shell tick.
+            z += 0.5 * gravity * flight * (flight + tick)
+            return x / flight, y / flight, z / flight
+
+        # Successive samples bracket both the low and high arcs if they exist.
+        # Cap the scan at the projectile's lifetime from the observation.
+        previous = tick
+        previous_error = math.hypot(*launch(previous)) - speed
+        for i in range(1, 39):
+            flight = tick + (stats["ttl"] - tick) * i / 38
+            error = math.hypot(*launch(flight)) - speed
+            if error * previous_error <= 0:
+                low, high = previous, flight
+                for _ in range(7):
+                    mid = 0.5 * (low + high)
+                    if (math.hypot(*launch(mid)) - speed) * previous_error > 0:
+                        low = mid
+                    else:
+                        high = mid
+                hit_time = (low + high) / 2
+                vx, vy, vz = launch(hit_time)
+                yaw = math.atan2(vy, vx)
+                pitch = math.atan2(vz, math.hypot(vx, vy))
+                impact = mx + vx * hit_time, my + vy * hit_time
+                future = me["pos"][0] + me["vel"][0] * hit_time, me["pos"][1] + me["vel"][1] * hit_time
+                if (
+                    me["stats"]["min_pitch"] <= pitch <= me["stats"]["max_pitch"]
+                    and min(horizontal(muzzle, impact), horizontal(future, impact)) > splash + 6
+                ):
+                    slices = max(3, math.ceil(hit_time / 0.15))
+                    origin = muzzle
+                    for step in range(1, slices + 1):
+                        t = hit_time * step / slices
+                        end = mx + vx * t, my + vy * t, mz + vz * t - 0.5 * gravity * t * (t + tick)
+                        if not self.map.shot_clear(origin, end):
+                            break
+                        origin = end
+                    else:
+                        return yaw, pitch, (splash * 0.4 / max(distance, 1))
+            previous, previous_error = flight, error
+        return None
+
+    def use_mortar(self, me, muzzle, target, velocity, act):
+        mortar = me["weapons"][1]
+        if mortar["cooldown"] > 0.15:
+            return False
+        solution = self.mortar_solution(me, muzzle, target, velocity)
+        if not solution:
+            return False
+        yaw, pitch, tolerance = solution
+        act["aim"] = [yaw, pitch]
+        aligned = abs(math.remainder(yaw - me["aim"][0], math.tau)) < tolerance
+        aligned = aligned and abs(pitch - me["aim"][1]) < tolerance
+        act["fire"] = [False, aligned]
+        if me["weapons"][0]["ammo"] == 0:
+            act["reload"] = True
+        return True
+
     def finish_time(self, me, foe, distance):
         """Estimate seconds of clear fire, allowing for the current magazine and secondary."""
         gun, secondary = me["weapons"]
@@ -167,7 +247,12 @@ class Bot:
         hp = foe["hp"] / bonus
         secondary_rate = 0
         delay = 0
-        if secondary and distance < secondary["stats"]["range"]:
+        if secondary and secondary["kind"] == "mortar":
+            weapon = secondary["stats"]
+            if 2 * weapon["splash_radius"] + 5 < distance < self.mortar_envelope(weapon):
+                secondary_rate = 0.55 * weapon["splash"] / weapon["cooldown"]
+                delay = secondary["cooldown"] + distance / weapon["speed"]
+        elif secondary and distance < secondary["stats"]["range"]:
             weapon = secondary["stats"]
             if secondary["kind"] == "laser":
                 cycle = weapon["charge"] + weapon["cooldown"]
@@ -223,6 +308,11 @@ class Bot:
             gun_wait = gun["stats"]["reload"]
         if distance > gun["stats"]["range"]:
             gun_wait = math.inf
+        if secondary and secondary["kind"] == "mortar":
+            stats = secondary["stats"]
+            if 2 * stats["splash_radius"] + 5 < distance < self.mortar_envelope(stats):
+                return min(gun_wait, secondary["cooldown"] + distance / stats["speed"])
+            return gun_wait
         if not secondary or distance > secondary["stats"]["range"]:
             return gun_wait
         stats = secondary["stats"]
@@ -460,6 +550,46 @@ class Bot:
             return move, me["energy"] > 45, False
         return None
 
+    def collect_upgrade(self, obs, exposed):
+        """Take a late pile only when it can buy the next upgrade in one short trip."""
+        me, zone = obs["self"], obs["zone"]
+        count = me["cubes"]
+        config = self.config["cubes"]
+        if count < config["stat_cap"] or not me["grounded"]:
+            return None
+        threshold = next((n for n in config["upgrade_thresholds"] if n > count), None)
+        if threshold is None or threshold - count > 7:
+            return None
+        p = me["pos"]
+        visible = [
+            cube
+            for cube in obs["cubes"]
+            if abs(cube["pos"][2] - p[2]) <= 4 and horizontal(p, cube["pos"]) <= 24
+        ]
+        if len(visible) < threshold - count:
+            return None
+        # A large late-game pile can contain most of the lobby's cubes.
+        if len(visible) > 24:
+            visible = sorted(visible, key=lambda cube: horizontal(p, cube["pos"]))[:24]
+        best = None
+        for cube in visible:
+            q = cube["pos"]
+            distance = horizontal(p, q)
+            if horizontal(q, zone["center"]) + 5 >= zone["radius"]:
+                continue
+            if any(horizontal(mark, q) < max(50, distance + 36) for _, mark in exposed):
+                continue
+            if not self.map.shot_clear((p[0], p[1], p[2] + 2), (q[0], q[1], q[2] + 2)):
+                continue
+            pile = sum(horizontal(other["pos"], q) < 8 for other in visible)
+            if pile >= threshold - count:
+                candidate = (distance - min(pile, 7) * 0.45, cube["id"], q)
+                if best is None or candidate < best:
+                    best = candidate
+        if best:
+            return toward(p, best[2], 0.5), False, False
+        return None
+
     def movement(self, obs, eyes, exposed, health, targets):
         me, zone, now = obs["self"], obs["zone"], obs["t"]
         p = me["pos"]
@@ -622,7 +752,9 @@ class Bot:
                     move = self.follow(p, ("pile", ident), now, lambda: self.map.travel(p, q))
                     if any(move):
                         return move, me["energy"] > 55, False
-        allowed = ("laser", "lightning")
+        laser_threat = any("laser" in foe["weapons"] and horizontal(p, q) < 140 for foe, q in exposed)
+        allow_mortar = not second and now >= self.mortar_wait and not laser_threat
+        allowed = ("laser", "lightning", "mortar") if allow_mortar else ("laser", "lightning")
         # A reachable secondary is worth a short opening detour, before committing to a perch.
         arc_duel = (
             second
@@ -636,7 +768,9 @@ class Bot:
                 distance = horizontal(p, q)
                 if abs(p[2] - q[2]) > 13 or item["kind"] not in allowed:
                     continue
-                if second and item["kind"] != "laser":
+                if item["kind"] == "mortar" and distance > 32:
+                    continue
+                if second and item["kind"] != "laser" and second["kind"] != "mortar":
                     continue
                 limit = (80 if not second else 50) if targets else self.loot_range
                 if (
@@ -648,7 +782,7 @@ class Bot:
                     and horizontal(q, zone["center"]) < zone["radius"] - 5
                 ):
                     priority = (
-                        distance * (1 if item["kind"] == "laser" else self.laser_bias)
+                        distance * {"laser": 1, "lightning": self.laser_bias, "mortar": 9}[item["kind"]]
                         + min(15, now - seen) * 0.8
                     )
                     candidates.append((priority, item["id"], q))
@@ -659,6 +793,11 @@ class Bot:
                     move = toward(p, q, self.reach * 0.6)
                 if any(move):
                     return move, me["energy"] > 52, False
+
+        if not targets and not self.healing and not on_roof:
+            pickup = self.collect_upgrade(obs, exposed)
+            if pickup is not None:
+                return pickup
 
         fresh_cube = None
         if not on_roof and me["cubes"] < self.config["cubes"]["stat_cap"] and health > 0.28:
@@ -817,6 +956,149 @@ class Bot:
                 move = [dx, dy]
         return move
 
+    def observe_crossfire(self, obs):
+        """Remember a rival's fresh wound when another mech's beam ends on it."""
+        t = obs["t"]
+        self.crossfire = {ident: expiry for ident, expiry in self.crossfire.items() if expiry > t}
+        beams = [b for b in obs["beams"] if len(b.get("path", ())) >= 2 and b.get("by") != obs["self"]["id"]]
+        if not beams or not self.config["vision"].get("show_enemy_hp", True):
+            return
+        own_hits = {e.get("target") for e in obs["events"] if e["type"] == "hit"}
+        for other in obs["mechs"]:
+            ident = other["id"]
+            previous = self.tracks.get(ident)
+            if other["kind"] != "mech" or ident in own_hits or not previous or t - previous[1] > 0.35:
+                continue
+            if previous[0].get("hp", 0) - other.get("hp", 0) < 25:
+                continue
+            pos = other["pos"]
+            scale = 1 + self.config["cubes"]["size_per_cube"] * other.get("cubes", 0)
+            radius = self.config["mech"]["radius"] * scale + 2
+            height = self.config["mech"]["height"] * scale
+            for beam in beams:
+                if beam["by"] == ident:
+                    continue
+                # A lightning path can hit multiple mechs. Its origin is the shooter.
+                if any(
+                    horizontal(pos, point) < radius and pos[2] - 2 <= point[2] <= pos[2] + height + 2
+                    for point in beam["path"][1:]
+                ):
+                    self.crossfire[ident] = t + 1.6
+                    break
+
+    def rank_engagements(self, obs, exposed):
+        """Price each visible duel in seconds and armor before committing."""
+        if not exposed:
+            return []
+        me, now = obs["self"], obs["t"]
+        pos = me["pos"]
+        gun, kit = me["weapons"]
+        hostile = set()
+        contacts = []
+        for enemy, point in exposed:
+            ident = enemy["id"]
+            dx, dy = pos[0] - point[0], pos[1] - point[1]
+            distance = max(1, math.hypot(dx, dy))
+            facing = (dx * math.cos(enemy["aim"][0]) + dy * math.sin(enemy["aim"][0])) / distance
+            closing = (dx * enemy["vel"][0] + dy * enemy["vel"][1]) / distance
+            recent = now - self.attackers.get(ident, -100) < 10
+            engaged = recent or distance < 30 or (facing > 0.93 and closing > 3 and distance < 55)
+            if engaged:
+                hostile.add(ident)
+            rate = max(18.0, 83 - 0.34 * distance)
+            if "lightning" in enemy["weapons"] and distance < 48:
+                rate += 115
+            if "laser" in enemy["weapons"] and distance < 210:
+                rate += 68
+            rate *= (
+                1
+                + min(enemy.get("cubes", 0), self.config["cubes"]["stat_cap"])
+                * self.config["cubes"]["damage_per_cube"]
+            )
+            contacts.append((enemy, point, distance, facing, rate))
+        incoming = sum(rate for enemy, _, _, _, rate in contacts if enemy["id"] in hostile)
+        choices = []
+        for enemy, point, distance, facing, rate in contacts:
+            ident = enemy["id"]
+            active = ident in hostile
+            if hostile and not active:
+                continue
+            rotation = abs(
+                math.remainder(math.atan2(point[1] - pos[1], point[0] - pos[0]) - me["aim"][0], math.tau)
+            )
+            time_to_turn = rotation / me["stats"]["turn_rate"]
+            # An opponent whose back is already exposed takes more early damage.
+            duel = self.finish_time(me, enemy, distance)
+            duration = max(0.3, duel - min(0.9, duel / 4) * float(facing < 0)) + time_to_turn
+            support = sum(
+                max(0, 1 - horizontal(other_point, point) / 95)
+                for other, other_point, _, _, _ in contacts
+                if other["id"] != ident
+            )
+            engagement_damage = duration * (max(rate, incoming) + support * 45)
+            # Only credit collectible drops when the zone and distance allow a pickup.
+            inside = horizontal(point, obs["zone"]["next_center"]) < obs["zone"]["next_radius"]
+            drop_value = (
+                max(0, 4.5 - distance / me["stats"]["walk_speed"] * 0.30)
+                if inside and me["cubes"] < self.config["cubes"]["stat_cap"]
+                else 0
+            )
+            retain = 0.8 if ident == self.last_target else 0
+            # Bid only in the strongest available tier: stop the current attacker,
+            # convert a near elimination, take a favorable opening, or start a duel.
+            tier = 0
+            if not active:
+                if not kit:
+                    continue
+                armor = me["hp"] / me["max_hp"]
+                short_finish = enemy["hp"] < 330 and armor > 0.87 and distance < 160
+                if short_finish:
+                    tier = 1
+                elif self.healing:
+                    continue
+                else:
+                    ready = (
+                        me["cubes"] >= self.opening_cubes or now >= self.opening_seconds or obs["alive"] < 13
+                    )
+                    weak_side = (
+                        enemy["hp"] < 530
+                        or kit["kind"] == "laser"
+                        and ("mortar" in enemy["weapons"] or facing < -0.35)
+                    )
+                    separated = all(
+                        o["id"] == ident or horizontal(point, o["pos"]) > 70 for o, _ in self.tracks.values()
+                    )
+                    if armor > 0.72 and ready and distance <= 125 and separated and weak_side:
+                        tier = 2
+                    else:
+                        if armor <= 0.82 or me["cubes"] < self.opening_cubes or enemy["hp"] > 1.05 * me["hp"]:
+                            continue
+                        arc = kit["kind"] == "lightning"
+                        if distance > (kit["stats"]["range"] - 2 if arc else 155) or (
+                            not arc and distance < 68 and "lightning" in enemy["weapons"]
+                        ):
+                            continue
+                        screens = sum(
+                            other["id"] != ident and horizontal(pos, mark) <= 175
+                            for other, mark, _, _, _ in contacts
+                        )
+                        if screens and (
+                            enemy["hp"] >= 0.65 * me["hp"]
+                            or duel >= 3.5
+                            or duel > self.reinforcement_time(obs, ident) + 0.6
+                        ):
+                            continue
+                        tier = 3
+            # When two targets are affordable, minimize time-to-elimination
+            # and expected incoming volleys, with a short switching penalty.
+            cost = duration + engagement_damage / max(110, me["hp"] * 0.32) - drop_value * 0.16 - retain
+            choices.append((tier, cost, ident, enemy, point))
+        if not choices:
+            return []
+        best_tier = min(row[0] for row in choices)
+        bids = sorted(row for row in choices if row[0] == best_tier)
+        return [(enemy, point) for _, _, _, enemy, point in bids]
+
     def act(self, obs):
         now, me = obs["t"], obs["self"]
         pos = me["pos"]
@@ -830,9 +1112,15 @@ class Bot:
             self.healing = True
         if health > 0.94:
             self.healing = False
+        self.observe_crossfire(obs)
         self.scanned.add((round(pos[0] / 35), round(pos[1] / 35)))
         for enemy in obs["mechs"]:
             if enemy["kind"] == "mech":
+                if enemy.get("hp") is None:
+                    enemy = dict(enemy)
+                    caps = self.config["cubes"]
+                    bonus = min(enemy.get("cubes", 0), caps["stat_cap"]) * caps["hp_per_cube"]
+                    enemy["hp"] = self.config["mech"]["hp"] * (1 + bonus)
                 self.tracks[enemy["id"]] = enemy, now
         self.tracks = {i: t for i, t in self.tracks.items() if now - t[1] < 7}
         for e in obs["events"]:
@@ -889,87 +1177,16 @@ class Bot:
                 exposed.append((enemy, center))
         second = me["weapons"][1]
 
-        # Look for the active pursuer before committing to a fight.
-        def pressing(pair):
-            foe, q = pair
-            d = horizontal(pos, q)
-            yaw = math.atan2(pos[1] - q[1], pos[0] - q[0])
-            aimed = abs(math.remainder(yaw - foe["aim"][0], math.tau)) < 0.38
-            approaching = foe["vel"][0] * math.cos(yaw) + foe["vel"][1] * math.sin(yaw) > 3
-            retaliate = now - self.attackers.get(foe["id"], -99) < 10
-            return retaliate or d < 30 or (aimed and approaching and d < 55)
-
-        targets = [pair for pair in exposed if pressing(pair)]
-        if not targets and second and health > 0.87:
-            targets = [
-                pair for pair in exposed if pair[0].get("hp", 1400) < 330 and horizontal(pos, pair[1]) < 160
-            ]
-        if (
-            not targets
-            and second
-            and not self.healing
-            and health > 0.72
-            and (me["cubes"] >= self.opening_cubes or now >= self.opening_seconds or obs["alive"] < 13)
-        ):
-            opportunities = []
-            for foe, q in exposed:
-                distance = horizontal(pos, q)
-                if distance > 125:
-                    continue
-                facing = math.cos(math.atan2(pos[1] - q[1], pos[0] - q[0]) - foe["aim"][0])
-                vulnerable = foe.get("hp", 1400) < 530 or (
-                    second["kind"] == "laser" and ("mortar" in foe["weapons"] or facing < -0.35)
-                )
-                isolated = all(
-                    other["id"] == foe["id"] or horizontal(q, other["pos"]) > 70
-                    for other, _ in self.tracks.values()
-                )
-                if vulnerable and isolated:
-                    opportunities.append((foe, q))
-            targets = opportunities
-
-        # Start a duel on our own terms once equipped. Other known opponents
-        # must be too far away or screened by solid geometry at this position.
-        if (
-            not targets
-            and second
-            and health > 0.82
-            and not self.healing
-            and me["cubes"] >= self.opening_cubes
-        ):
-            arc = second["kind"] == "lightning"
+        targets = self.rank_engagements(obs, exposed)
+        # Two rivals already trading can offer a short finishing shot.
+        if not targets and second and not self.healing and self.crossfire:
             for foe, point in exposed:
                 distance = horizontal(pos, point)
-                if distance > (second["stats"]["range"] - 2 if arc else 155):
+                if foe["id"] not in self.crossfire or foe["hp"] > 0.55 * me["hp"]:
                     continue
-                if "lightning" in foe["weapons"] and not arc and distance < 68:
-                    continue
-                if foe.get("hp", 1400) > me["hp"] * 1.05:
-                    continue
-                isolated = all(other["id"] == foe["id"] or horizontal(pos, q) > 175 for other, q in exposed)
-                # A second mech in view may be screened, facing away, or too
-                # late to save a damaged teammate. Allow a short finishing window.
-                if not isolated and foe["hp"] < 0.65 * me["hp"]:
-                    finish = self.finish_time(me, foe, distance)
-                    isolated = finish < 3.5 and finish <= self.reinforcement_time(obs, foe["id"]) + 0.6
-                if isolated:
+                if self.finish_time(me, foe, distance) < 2.6 and self.next_salvo(me, distance) < 0.5:
                     targets.append((foe, point))
 
-        def removal_cost(pair):
-            enemy, point = pair
-            dist = horizontal(pos, point)
-            direction = math.atan2(pos[1] - point[1], pos[0] - point[0])
-            rear = abs(math.remainder(direction - enemy["aim"][0], math.tau)) > math.pi / 2
-            efficiency = 1 + 0.4 * rear
-            if second and second["kind"] == "laser" and "mortar" in enemy["weapons"]:
-                efficiency += 0.45
-            return (
-                enemy.get("hp", 1400) / efficiency
-                + 2 * dist
-                - (165 if enemy["id"] == self.last_target else 0)
-            )
-
-        targets.sort(key=removal_cost)
         if targets:
             foe, point = targets[0]
             stamp, delivered, received = self.exchanges.get(foe["id"], (now, 0.0, 0.0))
@@ -1043,15 +1260,23 @@ class Bot:
                     boost = height < 45 and me["energy"] > 10
         gun, second = me["weapons"]
         act = {"tick": obs["tick"], "move": move, "boost": boost, "jump": jump}
+        laser_threat = any("laser" in foe["weapons"] and horizontal(pos, q) < 140 for foe, q in exposed)
+        allow_mortar = not second and now >= self.mortar_wait and not laser_threat
+        if second and second["kind"] == "mortar" and laser_threat:
+            act["drop"] = 1
         reachable = [
             i
             for i in obs["pickups"]
             if horizontal(i["pos"], pos) <= self.reach
             and abs(i["pos"][2] - pos[2]) <= 4
-            and i["kind"] in (("laser", "lightning"))
+            and (i["kind"] in ("laser", "lightning") or (allow_mortar and i["kind"] == "mortar"))
         ]
-        for item in sorted(reachable, key=lambda i: i["kind"] != "laser"):
-            if not second or item["kind"] == "laser" and second["kind"] != "laser":
+        for item in sorted(reachable, key=lambda i: ("laser", "lightning", "mortar").index(i["kind"])):
+            if (
+                not second
+                or (item["kind"] == "laser" and second["kind"] != "laser")
+                or (second["kind"] == "mortar" and item["kind"] == "lightning")
+            ):
                 act["take"] = item["id"]
                 if second:
                     act["drop"] = 1
@@ -1147,7 +1372,7 @@ class Bot:
             fire_secondary = False
             if laser and distance < second["stats"]["range"]:
                 fire_secondary = not (charging and second["charge"] >= threshold and beam_aligned)
-            elif second:
+            elif second and second["kind"] == "lightning":
                 fire_secondary = aligned and distance < second["stats"]["range"] and me["energy"] > 8
             if self.risk_to_bystander(
                 muzzle, *act["aim"], min(gun["stats"]["range"], distance + 12), enemy["id"]
@@ -1158,6 +1383,8 @@ class Bot:
                 elif not laser:
                     fire_secondary = False
             act["fire"] = [fire_primary, fire_secondary]
+            if second and second["kind"] == "mortar" and "drop" not in act:
+                self.use_mortar(me, muzzle, target, velocity, act)
         elif self.crate and health > 0.6:
             box = self.crate
             is_drone = box.get("kind") == "npc"
@@ -1181,6 +1408,8 @@ class Bot:
                 alt = aligned
             act["aim"] = [yaw, pitch]
             act["fire"] = [aligned, alt]
+            if second and second["kind"] == "mortar" and "drop" not in act:
+                self.use_mortar(me, muzzle, (*q[:2], q[2] + 1.2), v, act)
         else:
             if not second and now < 3 and now - self.last_hit > 1:
                 yaw = math.remainder(now * 3.6 + obs["self"]["id"] * 0.3, math.tau)
@@ -1196,6 +1425,8 @@ class Bot:
                 yaw = bearings[0]["bearing"] if bearings else math.remainder(2.8 * now, math.tau)
             act["aim"] = [yaw, 0]
             act["reload"] = gun["ammo"] < 0.6 * gun["stats"]["mag"]
+        if gun["reload"] > 0:
+            act.pop("reload", None)
         # Close a gap under foliage at a quiet walk. A nearby pursuer still requires solid cover.
         far_enough = (
             not eyes or min(horizontal(pos, q) for _, q in eyes) > self.config["vision"]["near_range"] + 32
@@ -1213,6 +1444,27 @@ class Bot:
             fraction = min(1, 0.9 * self.config["sound"]["step_speed"] / me["stats"]["walk_speed"])
             act["move"] = [fraction * u for u in act["move"]]
             act["boost"] = False
+        if (
+            second
+            and second["kind"] == "mortar"
+            and second["cooldown"] <= 0.15
+            and "drop" not in act
+            and not targets
+            and not exposed
+            and not self.crate
+            and not self.healing
+        ):
+            # The protocol keeps the moving position of a recently seen mech
+            # behind a wall. Use that information only for an existing duel.
+            contacts = [
+                (horizontal(pos, other["pos"]), other["id"], other)
+                for other, seen in self.tracks.values()
+                if now - seen < 0.5 and now - self.attackers.get(other["id"], -100) < 3
+            ]
+            if contacts:
+                _, _, other = min(contacts)
+                point = (*other["pos"][:2], other["pos"][2] + 2.0)
+                self.use_mortar(me, muzzle, point, other["vel"], act)
         return act
 
 
