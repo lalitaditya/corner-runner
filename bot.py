@@ -18,13 +18,13 @@ def toward(a, b, stop=1.4):
 
 
 class Bot:
-    name = "Corner Runner v7"
+    name = "Corner Runner v9"
     loot_range = 160
     staging_weight = 0.8
     opening_cubes = 3
     opening_seconds = 70
     cover_hp = 0.48
-    farm_cap = 16
+    farm_cap = 10
     loot_memory = 65
     avoid_radius = 60
     laser_bias = 4
@@ -339,7 +339,12 @@ class Bot:
         if not second:
             for obj in weapons:
                 candidates.append(("kit", obj, 3.9 if obj["kind"] == "laser" else 2.9, 0))
-        if me["cubes"] < self.opening_cubes:
+        useful_kit = any(
+            abs(p[2] - w["pos"][2]) <= 4 and horizontal(p, w["pos"]) < 100
+            and horizontal(w["pos"], zone["center"]) < zone["radius"] - 5
+            for w in weapons
+        )
+        if me["cubes"] < self.opening_cubes and (second or not useful_kit):
             for obj in cubes:
                 candidates.append(("cube", obj, 1.5, 0))
             for obj in boxes:
@@ -467,7 +472,7 @@ class Bot:
 
         # An elimination can leave a close group of cubes. During the short
         # salvage window, value the group and check whether a rival can contest it.
-        if self.salvage and now < self.salvage_until and not on_roof and health > 0.5 and me["cubes"] < 21:
+        if self.salvage and now < self.salvage_until and not on_roof and health > 0.5 and me["cubes"] < self.config["cubes"]["stat_cap"]:
             nearby = sorted(
                 (
                     cube
@@ -511,7 +516,7 @@ class Bot:
                     continue
                 if second and item["kind"] != "laser":
                     continue
-                limit = 50 if targets else self.loot_range
+                limit = (80 if not second else 50) if targets else self.loot_range
                 if (
                     distance <= limit
                     and not any(
@@ -534,7 +539,7 @@ class Bot:
                     return move, me["energy"] > 52, False
 
         fresh_cube = None
-        if not on_roof and me["cubes"] < 14 and health > 0.28:
+        if not on_roof and me["cubes"] < self.config["cubes"]["stat_cap"] and health > 0.28:
             options = [
                 (horizontal(p, c["pos"]), id, c["pos"])
                 for id, (c, _) in self.cube_memory.items()
